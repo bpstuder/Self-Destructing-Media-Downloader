@@ -13,11 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY TSDMD.py .
 
-# Declare volumes for persistent data
-VOLUME ["/app/sessions", "/app/Media"]
+# Create required directories with correct permissions
+RUN mkdir -p /app/sessions /app/Media && \
+    chown -R botuser:botuser /app
 
-# Hand over ownership to non-root user
-RUN chown -R botuser:botuser /app
 USER botuser
 
 CMD ["python", "-u", "TSDMD.py"]
