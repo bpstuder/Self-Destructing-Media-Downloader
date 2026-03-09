@@ -2,15 +2,11 @@ services:
   tsdmd:
     build: .
     restart: unless-stopped
-
-    # Credentials loaded from .env, never hardcoded
+    user: "1000:1000"  # use command id to get these values
     env_file: .env
-
     volumes:
-      - ./sessions:/app/sessions   # Telethon session file
-      - ./Media:/app/Media         # Downloaded media
-
-    # Hardening
+      - ./sessions:/app/sessions
+      - ./Media:/app/Media
     read_only: true
     tmpfs:
       - /tmp
