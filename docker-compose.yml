@@ -1,0 +1,20 @@
+services:
+  tsdmd:
+    build: .
+    restart: unless-stopped
+
+    # Credentials loaded from .env, never hardcoded
+    env_file: .env
+
+    volumes:
+      - ./sessions:/app/sessions   # Telethon session file
+      - ./Media:/app/Media         # Downloaded media
+
+    # Hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

@@ -1,71 +1,139 @@
-# The Self-Destructing Media Downloader
+# Self-Destructing Media Downloader
 
-A Python script that automatically downloads media (photos and videos) from private messages and replies to your "Saved Messages" in Telegram. This script simplifies the process of archiving and retrieving media content from Telegram conversations.
+A Python userbot that automatically downloads self-destructing media (photos and videos) from Telegram private messages before they disappear.
 
 ## Features
 
-- Automatically download photos and videos from private messages
-- Organize downloaded media by user
-- Admin commands for managing the bot and downloaded files
+- Automatically download self-destructing photos and videos from private messages
+- Organize downloaded media by sender
+- Admin commands to manage files and check bot status
 - Create ZIP archives of downloaded media
-- Ping functionality to check bot status
-- File management commands (list, download, delete)
+- Docker support for easy deployment
 
-## Prerequisites
+## Requirements
 
-Before running the script, you need to:
-
-1. Create a Telegram application and obtain the `API_ID` and `API_HASH` from [my.telegram.org](https://my.telegram.org/).
-2. Get your Telegram user ID (Admin ID) using the [@userinfobot](https://t.me/userinfobot) on Telegram.
+- Python 3.12+
+- A Telegram account with API credentials from [my.telegram.org](https://my.telegram.org/)
+- Your Telegram user ID (get it from [@userinfobot](https://t.me/userinfobot))
 
 ## Installation
 
-1. Clone this repository:
+### Standard
+
+1. Clone the repository:
 
 ```bash
-git clone https://github.com/ZeroParadoxHome/Self-Destructing-Media-Downloader.git
+git clone https://github.com/bpstuder/Self-Destructing-Media-Downloader.git
 cd Self-Destructing-Media-Downloader
 ```
 
-2. Install the required packages:
+2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Configuration
+3. Create a `.env` file at the root of the project:
 
-The script will prompt you to enter your `API_ID`, `API_HASH`, and `Admin ID` when you run it for the first time. These values will be saved in a `settings.json` file for future use.
+```bash
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=0123456789abcdef0123456789abcdef
+TELEGRAM_ADMIN_ID=123456789
+```
 
-## Usage
-
-To run the script, use the following command:
+4. Run the bot:
 
 ```bash
 python TSDMD.py
 ```
 
-Once the bot is running, you can use the following commands:
+### Docker
 
-- `/help` - Display the help menu with available commands
-- `/ping` - Check if the bot is alive and measure ping time
-- `/status` - Get the number of downloaded files (Photos/Videos) in the media folder
-- `/files` - List all files in the script folder
-- `/check` - Perform a check for new files in the media folder
-- `/download [file_path]` - Download a specific file from the script folder
-- `/delete [file_path]` - Delete a specific file from the script folder
-- `/all` - Download all available media files from the media folder
-- `/zip` - Create and send a zip file containing files from the project folder
+1. Create your `.env` file as above, and add:
 
-## How it works
+```bash
+SESSION_DIR=/app/sessions
+```
 
-1. The bot automatically downloads media files (photos and videos) sent to it via private messages.
-2. Downloaded files are organized in folders named after the sender's username and user ID.
-3. The bot can be controlled using various admin commands to manage downloaded files and check the bot's status.
+2. First run (interactive — required for Telegram authentication):
+
+```bash
+docker compose run --rm tsdmd
+```
+
+Enter your phone number, the SMS code, and your 2FA password if enabled.
+The session file is saved in `./sessions/` and reused on every subsequent start.
+
+3. Run as a background daemon:
+
+```bash
+docker compose up -d
+```
+
+4. View logs:
+
+```bash
+docker compose logs -f tsdmd
+```
+
+5. Stop:
+
+```bash
+docker compose down
+```
+
+## Configuration
+
+All credentials are loaded from environment variables. **Never hardcode them in the source code.**
+
+| Variable | Description |
+|---|---|
+| `TELEGRAM_API_ID` | Your API ID from my.telegram.org |
+| `TELEGRAM_API_HASH` | Your API hash from my.telegram.org |
+| `TELEGRAM_ADMIN_ID` | Your Telegram user ID |
+| `SESSION_DIR` | Directory for the session file (optional, default: `.`) |
+
+## Commands
+
+Once the bot is running, send these commands to yourself in a private Telegram chat:
+
+| Command | Description |
+|---|---|
+| `/help` | Display the help menu |
+| `/ping` | Check if the bot is alive and measure ping time |
+| `/status` | Get the number of downloaded files (photos/videos) |
+| `/files` | List all files in the media folder |
+| `/check` | List current files in the media folder |
+| `/download [file_path]` | Send a specific file to you |
+| `/delete [file_path]` | Delete a specific file |
+| `/all` | Send all media files to you |
+| `/zip` | Create and send a ZIP of all media files |
+
+## Project Structure
+
+```
+Self-Destructing-Media-Downloader/
+├── TSDMD.py              # Main bot script
+├── requirements.txt      # Python dependencies
+├── Dockerfile
+├── docker-compose.yml
+├── .env                  # Credentials (never commit this)
+├── .gitignore
+├── sessions/             # Telethon session file (never commit this)
+└── Media/                # Downloaded media (never commit this)
+```
+
+## Security
+
+- Credentials are stored in `.env`, never in the source code or a JSON file
+- The `.session` file and `.env` are excluded from git via `.gitignore`
+- File path inputs are validated to prevent directory traversal attacks
+- The Docker container runs as a non-root user with minimal capabilities
+- The `/zip` command only includes media files, never credentials or session files
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome. Please open an issue or submit a pull request.
 
 ## License
 
@@ -73,8 +141,4 @@ This project is open source and available under the [MIT License](LICENSE).
 
 ## Disclaimer
 
-This tool is for educational purposes only, So Please respect copyright laws and the privacy of others when using this script.
-
-## Support
-
-Please open an issue on the GitHub repository if you encounter any issues or have questions.
+This tool is for personal and educational use only. Please respect copyright laws and the privacy of others when using this script.

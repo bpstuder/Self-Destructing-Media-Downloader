@@ -1,0 +1,9 @@
+.env
+settings.json
+*.session
+*.session-journal
+downloads/
+Media/
+__pycache__/
+*.pyc
+.venv

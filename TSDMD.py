@@ -1,451 +1,334 @@
-# -*- coding:utf-8 -*-
+# -*- coding: utf-8 -*-
 
 import asyncio
-import json
 import logging
 import os
-import random
+import re
 import string
 import time
 import zipfile
-import aiofiles
+
 import aiohttp
-from rich.console import Console
+from dotenv import load_dotenv
 from rich.progress import Progress
 from telethon import TelegramClient, events
 
+# ─── Constants ────────────────────────────────────────────────────────────────
 
-# Define and create necessary directories
-all_media_dir = "Media"
-if not os.path.exists(all_media_dir):
-    os.makedirs(all_media_dir)
+MEDIA_DIR = "Media"
+BASE_DIR = os.path.realpath(os.path.dirname(__file__))
+ZIP_ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4", ".avi", ".mkv"}
 
-# Configure logging to display logs in the terminal
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+# ─── Setup ────────────────────────────────────────────────────────────────────
 
-# Create a StreamHandler for terminal output
-log_handler = logging.StreamHandler()
-log_handler.setFormatter(formatter)
-log_handler.setLevel(logging.INFO)
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
-# Configure the logger
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-logger.addHandler(log_handler)
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# Create a console instance for rich.
-console = Console()
+# ─── Config ───────────────────────────────────────────────────────────────────
 
-SETTINGS_FILE = "settings.json"
+def load_config() -> tuple[int, str, int]:
+    """Load credentials from environment variables (.env file)."""
+    load_dotenv()
 
+    api_id    = os.getenv("TELEGRAM_API_ID")
+    api_hash  = os.getenv("TELEGRAM_API_HASH")
+    admin_id  = os.getenv("TELEGRAM_ADMIN_ID")
 
-# Load API configuration from settings file or prompt user input if file doesn't exist.
-async def load_config():
-    if os.path.exists(SETTINGS_FILE):
-        async with aiofiles.open(SETTINGS_FILE, mode="r") as file:
-            settings = json.loads(await file.read())
-        api_id = settings.get("api_id")
-        api_hash = settings.get("api_hash")
-        admin_id = settings.get("admin_id")
+    missing = [
+        name for name, val in {
+            "TELEGRAM_API_ID": api_id,
+            "TELEGRAM_API_HASH": api_hash,
+            "TELEGRAM_ADMIN_ID": admin_id,
+        }.items() if not val
+    ]
+    if missing:
+        raise ValueError(f"Missing variables in .env: {', '.join(missing)}")
 
-        if not admin_id:
-            admin_id = input("Enter the Admin ID: ")
-            settings["admin_id"] = admin_id
-            async with aiofiles.open(SETTINGS_FILE, mode="w") as file:
-                await file.write(json.dumps(settings))
+    return int(api_id), api_hash, int(admin_id)
 
-        return api_id, api_hash, int(admin_id)
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-    else:
-        api_id = input("Enter your API_ID: ")
-        api_hash = input("Enter your API_HASH: ")
-        admin_id = input("Enter the Admin ID: ")
-        async with aiofiles.open(SETTINGS_FILE, mode="w") as file:
-            await file.write(
-                json.dumps(
-                    {"api_id": api_id, "api_hash": api_hash, "admin_id": admin_id}
-                )
-            )
-        return api_id, api_hash, int(admin_id)
+def safe_path(user_input: str, allowed_dir: str) -> str | None:
+    """
+    Resolve a user-supplied path and verify it stays within allowed_dir.
+    Returns the absolute path, or None if the path escapes the directory.
+    """
+    full_path = os.path.realpath(os.path.join(allowed_dir, user_input))
+    if full_path.startswith(allowed_dir + os.sep) or full_path == allowed_dir:
+        return full_path
+    return None
 
 
-# Check if the sender is the admin
-async def is_admin(event, admin_id):
-    return event.sender_id == admin_id
+def sanitize_username(username: str) -> str:
+    """Remove any character that isn't alphanumeric, underscore or hyphen."""
+    return re.sub(r"[^\w\-]", "_", username)
 
 
-# Reconnect the Telegram client if disconnected.
-async def reconnect_client(client):
-    try:
-        await client.disconnect()
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise Exception("Client not authorized")
-    except Exception as e:
-        logger.critical(f"Failed to reconnect client: {e}")
-        await asyncio.sleep(random.uniform(5, 15))
-        await reconnect_client(client)
-
-
-# Custom progress bar for showing download progress using rich.
 class RichProgressBar:
-    def __init__(self, total):
+    """Custom progress bar for download callbacks using rich."""
+
+    def __init__(self, total: int):
         self.progress = Progress()
         self.task = self.progress.add_task("[cyan]Downloading...", total=total)
+        self.progress.start()
 
-    def __call__(self, current, total):
+    def __call__(self, current: int, total: int):
         self.progress.update(self.task, completed=current)
 
     def close(self):
         self.progress.stop()
 
+# ─── Bot ──────────────────────────────────────────────────────────────────────
 
-# Display a welcome message and instructions.
-async def show_welcome(event):
-    if await is_admin(event, admin_id):
-        welcome_message = (
-            "Welcome to the Self-Destructing-Media-Downloader Bot Helper Menu!\n\n"
-            "Here are the commands you can use:\n\n"
-            "/ping - Check if the bot is alive and measure ping time.\n"
-            "/status - Get the number of downloaded files (Photos/Videos) in the media folder.\n"
-            "/files - List all files in the script folder.\n"
-            "/check - Perform a check for new files in the media folder.\n"
-            "/download [file_path] - Download a specific file from the script folder.\n"
-            "/delete [file_path] - Delete a specific file from the script folder.\n"
-            "/all - Download all available media files from the media folder.\n"
-            "/zip - Create and send a zip file containing files from the project folder.\n\n"
-            "Make sure to replace [file_path] with the actual path to the file you want to access.\n"
-            "Enjoy Using Bot..."
-        )
-        await event.respond(welcome_message)
+class Bot:
+    def __init__(self, api_id: int, api_hash: str, admin_id: int):
+        self.api_id   = api_id
+        self.api_hash = api_hash
+        self.admin_id = admin_id
+        SESSION_PATH = os.path.join(os.getenv("SESSION_DIR", "."), "TSMD")
+        self.client  = TelegramClient(SESSION_PATH, api_id, api_hash)
+        self._letter_iter = iter(string.ascii_uppercase)
 
+    # ── Utilities ─────────────────────────────────────────────────────────────
 
-# Check if the bot is alive and measure ping time.
-async def handle_ping(event):
-    if await is_admin(event, admin_id):
-        url = "https://www.google.com"
+    async def is_admin(self, event) -> bool:
+        return event.sender_id == self.admin_id
+
+    def get_next_letter(self) -> str:
         try:
-            start_time = time.time()
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    end_time = time.time()
-                    ping_time = round((end_time - start_time) * 1000)
-                    await event.respond(
-                        f"The bot is alive and running, Ping: {ping_time} ms!"
-                    )
-        except Exception as e:
-            logger.error(f"Error in pinging Google: {str(e)}")
-            await event.respond(f"Failed to measure ping time, Error: {str(e)}")
+            return next(self._letter_iter)
+        except StopIteration:
+            self._letter_iter = iter(string.ascii_uppercase)
+            return next(self._letter_iter)
 
+    # ── Handlers ──────────────────────────────────────────────────────────────
 
-# Show the number of downloaded files in the media folder.
-async def handle_status(event):
-    if await is_admin(event, admin_id):
-
-        def count_files_in_directory(directory):
-            count_photos = 0
-            count_videos = 0
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    if file.lower().endswith((".jpg", ".jpeg", ".png")):
-                        count_photos += 1
-                    elif file.lower().endswith((".mp4", ".avi", ".mkv")):
-                        count_videos += 1
-            return count_photos, count_videos
-
-        photos_count, videos_count = count_files_in_directory(all_media_dir)
+    async def show_welcome(self, event):
+        if not await self.is_admin(event):
+            return
         await event.respond(
-            f"The Bot Status:\nTotal Photos: {photos_count}\nTotal Videos: {videos_count}"
+            "Welcome to the Self-Destructing Media Downloader!\n\n"
+            "Available commands:\n"
+            "/ping    - Check if the bot is alive and measure ping time.\n"
+            "/status  - Get the number of downloaded files in the media folder.\n"
+            "/files   - List all files in the media folder.\n"
+            "/check   - List current files in the media folder.\n"
+            "/download [file_path] - Send a specific file to you.\n"
+            "/delete  [file_path]  - Delete a specific file.\n"
+            "/all     - Send all media files to you.\n"
+            "/zip     - Create and send a zip of all media files.\n"
         )
 
+    async def handle_ping(self, event):
+        if not await self.is_admin(event):
+            return
+        try:
+            start = time.time()
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://www.google.com"):
+                    ping_ms = round((time.time() - start) * 1000)
+            await event.respond(f"Bot is alive! Ping: {ping_ms} ms")
+        except Exception as e:
+            logger.error(f"Ping error: {e}")
+            await event.respond(f"Failed to measure ping: {e}")
 
-# List all files in the script folder.
-async def handle_files(event):
-    if await is_admin(event, admin_id):
-        if event.sender_id == (await client.get_me()).id:
+    async def handle_status(self, event):
+        if not await self.is_admin(event):
+            return
+        photos, videos = 0, 0
+        for root, dirs, files in os.walk(MEDIA_DIR):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in {".jpg", ".jpeg", ".png"}:
+                    photos += 1
+                elif ext in {".mp4", ".avi", ".mkv"}:
+                    videos += 1
+        await event.respond(f"Bot Status:\nPhotos: {photos}\nVideos: {videos}")
 
-            def list_files_and_folders(directory):
-                if not os.path.isdir(directory):
-                    return f"The directory {directory} does not exist."
-                files_list = ""
-                for root, dirs, files in os.walk(directory):
-                    dirs[:] = [d for d in dirs if not d.startswith(".")]
-                    files_list += f"Directory: {root}\n"
-                    # if dirs:
-                    #     for dir_name in dirs:
-                    #         files_list += (
-                    #             f"  Subdirectory: {os.path.join(root, dir_name)}\n"
-                    #         )
-                    if files:
-                        for file_name in files:
-                            if not file_name.startswith("."):
-                                files_list += (
-                                    f"    File: {os.path.join(root, file_name)}\n"
-                                )
-                return files_list
+    async def handle_files(self, event):
+        if not await self.is_admin(event):
+            return
+        lines = []
+        for root, dirs, files in os.walk(MEDIA_DIR):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            lines.append(f"Directory: {root}")
+            for file_name in files:
+                if not file_name.startswith("."):
+                    lines.append(f"    File: {os.path.join(root, file_name)}")
+        await event.respond("\n".join(lines) if lines else "No files found.")
 
-            files_list = list_files_and_folders(".")
-            await event.respond(files_list)
-
-
-# Perform a check for new files in the media folder.
-async def handle_check(event):
-    if await is_admin(event, admin_id):
-
-        def get_current_files(directory):
-            if not os.path.isdir(directory):
-                return []
-            current_files = []
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    current_files.append(os.path.join(root, file))
-            return current_files
-
-        current_files = get_current_files(all_media_dir)
+    async def handle_check(self, event):
+        if not await self.is_admin(event):
+            return
+        current_files = [
+            os.path.join(root, file)
+            for root, dirs, files in os.walk(MEDIA_DIR)
+            for file in files
+        ]
         if current_files:
             await event.respond("Current files:\n" + "\n".join(current_files))
         else:
-            await event.respond("No new files found in the media folder.")
+            await event.respond("No files found in the media folder.")
 
-
-# Download a specific file from the script folder.
-async def handle_download(event):
-    if await is_admin(event, admin_id):
+    async def handle_download(self, event):
+        if not await self.is_admin(event):
+            return
         try:
-            file_path = event.pattern_match.group(1).strip()
-            if os.path.exists(file_path):
-                await client.send_file(event.sender_id, file_path)
-                await event.respond(f"File {file_path} sent successfully!")
+            user_input = event.pattern_match.group(1).strip()
+            file_path  = safe_path(user_input, BASE_DIR)
+
+            if file_path is None:
+                logger.warning(f"Path traversal attempt blocked: {user_input}")
+                await event.respond("⛔ Unauthorized path.")
+                return
+
+            if os.path.isfile(file_path):
+                await self.client.send_file(event.sender_id, file_path)
+                await event.respond("File sent successfully!")
             else:
-                await event.respond(f"File {file_path} does not exist.")
-        except FileNotFoundError:
-            logger.error(f"File {file_path} not found during download.")
-            await event.respond(f"Error: File {file_path} not found.")
-        except PermissionError:
-            logger.error(f"Permission denied for file {file_path}.")
-            await event.respond(f"Error: Permission denied for {file_path}.")
+                await event.respond("File not found.")
         except Exception as e:
-            logger.error(f"Error in /download command: {str(e)}")
-            await event.respond(f"Error in downloading file: {str(e)}")
+            logger.error(f"Error in /download: {e}")
+            await event.respond(f"Error: {e}")
 
-
-# Delete a specific file from the script folder.
-async def handle_delete(event):
-    if await is_admin(event, admin_id):
+    async def handle_delete(self, event):
+        if not await self.is_admin(event):
+            return
         try:
-            file_path = event.pattern_match.group(1).strip()
-            if os.path.exists(file_path):
+            user_input = event.pattern_match.group(1).strip()
+            file_path  = safe_path(user_input, BASE_DIR)
+
+            if file_path is None:
+                logger.warning(f"Path traversal attempt blocked: {user_input}")
+                await event.respond("⛔ Unauthorized path.")
+                return
+
+            if os.path.isfile(file_path):
                 os.remove(file_path)
-                await event.respond(f"File {file_path} deleted successfully!")
+                await event.respond("File deleted successfully!")
             else:
-                await event.respond(f"File {file_path} does not exist.")
-        except FileNotFoundError:
-            logger.error(f"File {file_path} not found during deletion.")
-            await event.respond(f"Error: File {file_path} not found.")
-        except PermissionError:
-            logger.error(f"Permission denied for file {file_path}.")
-            await event.respond(f"Error: Permission denied for {file_path}.")
+                await event.respond("File not found.")
         except Exception as e:
-            logger.error(f"Error in /delete command: {str(e)}")
-            await event.respond(f"Error in deleting file: {str(e)}")
+            logger.error(f"Error in /delete: {e}")
+            await event.respond(f"Error: {e}")
 
-
-# Download all available media files from the media folder.
-async def handle_all(event):
-    if await is_admin(event, admin_id):
+    async def handle_all(self, event):
+        if not await self.is_admin(event):
+            return
         try:
-
-            def get_media_files(directory):
-                media_files = []
-                for root, dirs, files in os.walk(directory):
-                    for file in files:
-                        if file.lower().endswith(
-                            (".jpg", ".jpeg", ".png", ".mp4", ".avi", ".mkv")
-                        ):
-                            media_files.append(os.path.join(root, file))
-                return media_files
-
-            media_files = get_media_files(all_media_dir)
+            media_files = [
+                os.path.join(root, file)
+                for root, dirs, files in os.walk(MEDIA_DIR)
+                for file in files
+                if os.path.splitext(file)[1].lower() in ZIP_ALLOWED_EXTENSIONS
+            ]
             if media_files:
                 for media_file in media_files:
-                    await client.send_file(event.sender_id, media_file)
+                    await self.client.send_file(event.sender_id, media_file)
                 await event.respond("All media files sent successfully!")
             else:
-                await event.respond("No media files found in the media folder.")
-        except FileNotFoundError as e:
-            logger.error(f"File not found during download: {e}")
-            await event.respond("Error: File not found.")
-        except PermissionError as e:
-            logger.error(f"Permission denied: {e}")
-            await event.respond("Error: Permission denied.")
+                await event.respond("No media files found.")
         except Exception as e:
-            logger.error(f"Error in /all command: {str(e)}")
-            await event.respond(f"Error in downloading all media files: {str(e)}")
+            logger.error(f"Error in /all: {e}")
+            await event.respond(f"Error: {e}")
 
-
-# Create zip file containing files from project folder.
-async def handle_zip(event):
-    if await is_admin(event, admin_id):
+    async def handle_zip(self, event):
+        if not await self.is_admin(event):
+            return
         try:
-            folder_paths = ["."]  # Add your desired folder paths here
             zip_filename = "media_files.zip"
             with zipfile.ZipFile(zip_filename, "w") as zipf:
-                for folder_path in folder_paths:
-                    for file_name in os.listdir(folder_path):
-                        full_path = os.path.join(folder_path, file_name)
-                        if os.path.isfile(full_path):
-                            zipf.write(
-                                full_path, os.path.relpath(full_path, folder_path)
-                            )
-            await client.send_file(event.sender_id, zip_filename)
+                for root, dirs, files in os.walk(MEDIA_DIR):
+                    for file_name in files:
+                        if os.path.splitext(file_name)[1].lower() in ZIP_ALLOWED_EXTENSIONS:
+                            full_path = os.path.join(root, file_name)
+                            zipf.write(full_path, os.path.relpath(full_path, MEDIA_DIR))
+
+            await self.client.send_file(event.sender_id, zip_filename)
             await event.respond("ZIP file created and sent successfully!")
             os.remove(zip_filename)
-        except FileNotFoundError as e:
-            logger.error(f"File not found during zipping: {e}")
-            await event.respond("Error: File not found.")
-        except PermissionError as e:
-            logger.error(f"Permission denied during zipping: {e}")
-            await event.respond("Error: Permission denied.")
         except Exception as e:
-            logger.error(f"Error in /zip command: {str(e)}")
-            await event.respond(f"Error in creating zip file: {str(e)}")
+            logger.error(f"Error in /zip: {e}")
+            await event.respond(f"Error creating zip file: {e}")
 
+    async def downloader(self, event):
+        """Automatically download received self-destructing media."""
+        me = await self.client.get_me()
+        if event.sender_id == me.id:
+            return
 
-# Initialize letters as a global variable
-letters = iter(string.ascii_uppercase)
+        sender      = await event.get_sender()
+        raw_username = sender.username if sender.username else "unknown"
+        username    = sanitize_username(raw_username)
+        user_id     = str(sender.id) if sender.id else "unknown"
 
-
-# Function to get the next letter in the sequence
-def get_next_letter():
-    global letters
-    try:
-        return next(letters)
-    except StopIteration:
-        letters = iter(string.ascii_uppercase)
-        return next(letters)
-
-
-# Automatically download received media files.
-async def downloader(event):
-    me = await client.get_me()
-    if event.sender_id != me.id:
-        sender = await event.get_sender()
-        username = sender.username if sender.username else "None"
-        user_id = sender.id if sender.id else "None"
-
-        existing_folder = None
-        for folder in os.listdir(all_media_dir):
-            if f"@{username} - {user_id}" in folder:
-                existing_folder = folder
-                break
-
+        # Reuse existing folder for this user if it exists
+        existing_folder = next(
+            (f for f in os.listdir(MEDIA_DIR) if f"@{username} - {user_id}" in f),
+            None,
+        )
         if existing_folder:
             user_folder_name = existing_folder
         else:
-            letter = get_next_letter()
+            letter = self.get_next_letter()
             user_folder_name = f"{letter} - @{username} - {user_id}"
 
-        user_folder_path = os.path.join(all_media_dir, user_folder_name)
+        user_folder_path = os.path.join(MEDIA_DIR, user_folder_name)
+        os.makedirs(user_folder_path, exist_ok=True)
 
-        if not os.path.exists(user_folder_path):
-            try:
-                os.makedirs(user_folder_path)
-                logger.info(f"Created folder for user: {user_folder_name}")
-            except Exception as e:
-                logger.error(f"Failed to create folder {user_folder_path}: {e}")
-                await event.respond(
-                    f"Error creating folder for user: {user_folder_name}"
-                )
-                return
-
-        logger.info(
-            f"Received media from {username} (ID: {user_id}). Starting download..."
-        )
+        logger.info(f"Received media from @{username} (ID: {user_id}). Downloading...")
         try:
-            total_size = event.file.size
-            progress_bar = RichProgressBar(total_size)
+            progress_bar = RichProgressBar(event.file.size)
             result = await event.download_media(
-                file=user_folder_path, progress_callback=progress_bar
+                file=user_folder_path,
+                progress_callback=progress_bar,
             )
             progress_bar.close()
+
             media_type = "photo" if event.photo else "video"
-            logger.info(
-                f"{media_type.capitalize()} downloaded successfully from {username} (ID: {user_id})"
+            logger.info(f"{media_type.capitalize()} downloaded from @{username} (ID: {user_id})")
+            await self.client.send_file(
+                "me", result, caption=f"Downloaded from @{raw_username}"
             )
-            await client.send_file(
-                "me", result, caption=f"Downloaded by @H0lyFanz from {username}"
-            )
-        except FileNotFoundError as e:
-            logger.error(f"File not found during download: {e}")
-            await event.respond("File not found during the download.")
-        except PermissionError as e:
-            logger.error(f"Permission error during download: {e}")
-            await event.respond("Permission error during the download.")
         except Exception as e:
-            logger.error(
-                f"Failed to download media from {username} (ID: {user_id}): {str(e)}"
-            )
-            await event.respond(f"Error in downloading media: {str(e)}")
+            logger.error(f"Failed to download media from @{username}: {e}")
+            await event.respond(f"Error downloading media: {e}")
 
+    # ── Registration ──────────────────────────────────────────────────────────
 
-# Main function to start the Telegram client and run it until disconnected.
+    def register_handlers(self):
+        add = self.client.add_event_handler
+        priv = lambda e: e.is_private  # noqa: E731
+
+        add(self.show_welcome,    events.NewMessage(func=lambda e: priv(e) and e.text == "/help"))
+        add(self.handle_ping,     events.NewMessage(func=lambda e: priv(e) and e.text == "/ping"))
+        add(self.handle_status,   events.NewMessage(func=lambda e: priv(e) and e.text == "/status"))
+        add(self.handle_files,    events.NewMessage(func=lambda e: priv(e) and e.text == "/files"))
+        add(self.handle_check,    events.NewMessage(func=lambda e: priv(e) and e.text == "/check"))
+        add(self.handle_all,      events.NewMessage(func=lambda e: priv(e) and e.text == "/all"))
+        add(self.handle_zip,      events.NewMessage(func=lambda e: priv(e) and e.text == "/zip"))
+        add(self.handle_download, events.NewMessage(pattern=r"/download (.+)", func=priv))
+        add(self.handle_delete,   events.NewMessage(pattern=r"/delete (.+)",   func=priv))
+        add(self.downloader,      events.NewMessage(
+            func=lambda e: priv(e) and (e.photo or e.video) and e.media_unread
+        ))
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
 async def main():
-    global client, admin_id
-    api_id, api_hash, admin_id = await load_config()
-    client = TelegramClient("H0lyFanz", api_id, api_hash)
+    api_id, api_hash, admin_id = load_config()
+    bot = Bot(api_id, api_hash, admin_id)
+    bot.register_handlers()
 
-    # Register event handlers
-    client.add_event_handler(
-        show_welcome,
-        events.NewMessage(func=lambda e: e.is_private and e.text == "/help"),
-    )
-    client.add_event_handler(
-        handle_ping,
-        events.NewMessage(func=lambda e: e.is_private and e.text == "/ping"),
-    )
-    client.add_event_handler(
-        handle_status,
-        events.NewMessage(func=lambda e: e.is_private and e.text == "/status"),
-    )
-    client.add_event_handler(
-        handle_files,
-        events.NewMessage(func=lambda e: e.is_private and e.text == "/files"),
-    )
-    client.add_event_handler(
-        handle_check,
-        events.NewMessage(func=lambda e: e.is_private and e.text == "/check"),
-    )
-    client.add_event_handler(
-        handle_download,
-        events.NewMessage(pattern=r"/download (.+)", func=lambda e: e.is_private),
-    )
-    client.add_event_handler(
-        handle_delete,
-        events.NewMessage(pattern=r"/delete (.+)", func=lambda e: e.is_private),
-    )
-    client.add_event_handler(
-        handle_all, events.NewMessage(func=lambda e: e.is_private and e.text == "/all")
-    )
-    client.add_event_handler(
-        handle_zip, events.NewMessage(func=lambda e: e.is_private and e.text == "/zip")
-    )
-    client.add_event_handler(
-        downloader,
-        events.NewMessage(
-            func=lambda e: e.is_private and (e.photo or e.video) and e.media_unread
-        ),
-    )
-    try:
-        await client.start()
-        logger.info("Bot is running...")
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.critical(f"Unexpected error: {e}")
-        await reconnect_client(client)
+    await bot.client.start()
+    logger.info("Bot is running...")
+    await bot.client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.critical(f"Unhandled exception: {e}")
+    asyncio.run(main())
